@@ -1,8 +1,9 @@
 use anyhow::Result;
-use bevy_asset::{AssetLoader, AssetPath, LoadContext, LoadedAsset};
+use bevy_asset::{AssetLoader, AssetPath, Handle, LoadContext, LoadedAsset};
 use bevy_ecs::world::World;
 use bevy_math::Vec3;
 use bevy_pbr::prelude::{PbrBundle, StandardMaterial};
+use bevy_reflect::TypeUuid;
 use bevy_render::{
     color::Color,
     mesh::{shape::Cube, Mesh},
@@ -13,11 +14,14 @@ use bevy_transform::{
     prelude::{GlobalTransform, Transform},
 };
 use bevy_utils::BoxedFuture;
-use dot_vox::DotVoxData;
+use dot_vox::{DotVoxData, Model};
 use thiserror::Error;
 
 #[derive(Default)]
-pub struct VoxLoader;
+pub struct VoxLoader {
+    /// MagicaVoxel considers Z as height. Setting this to true will use Y as height
+    pub swap_yz: bool,
+}
 
 impl AssetLoader for VoxLoader {
     fn load<'a>(
@@ -25,13 +29,20 @@ impl AssetLoader for VoxLoader {
         bytes: &'a [u8],
         load_context: &'a mut LoadContext,
     ) -> BoxedFuture<'a, Result<()>> {
-        Box::pin(async move { Ok(load_vox(bytes, load_context).await?) })
+        Box::pin(async move { Ok(load_vox(bytes, load_context, self.swap_yz).await?) })
     }
 
     fn extensions(&self) -> &[&str] {
         static EXTENSIONS: &[&str] = &["vox"];
         EXTENSIONS
     }
+}
+
+#[derive(TypeUuid)]
+#[uuid = "5ab7c607-8e8d-4dc5-8ab4-64c8000e8131"]
+pub struct VoxAsset {
+    pub scene: Handle<Scene>,
+    pub size: Vec3,
 }
 
 #[derive(Error, Debug)]
@@ -43,6 +54,7 @@ pub enum VoxError {
 async fn load_vox<'a, 'b>(
     bytes: &'a [u8],
     load_context: &'a mut LoadContext<'b>,
+    swap_yz: bool,
 ) -> Result<(), VoxError> {
     let mut world = World::default();
     // let world_builder = &mut world.build();
@@ -84,6 +96,8 @@ async fn load_vox<'a, 'b>(
     let mesh: Mesh = Mesh::from(Cube { size });
     load_context.set_labeled_asset("cube", LoadedAsset::new(mesh));
 
+    let mut last_model: Option<&Model> = None;
+
     for model in data.models.iter() {
         world
             .spawn()
@@ -96,27 +110,48 @@ async fn load_vox<'a, 'b>(
                     let material_asset_path =
                         AssetPath::new_ref(load_context.path(), Some(&material_label));
 
+                    let (x, y, z) = if swap_yz {
+                        (vox.x, vox.z, vox.y)
+                    } else {
+                        (vox.x, vox.y, vox.z)
+                    };
+
                     parent.spawn_bundle(PbrBundle {
                         mesh: load_context.get_handle(vox_asset_path),
                         material: load_context.get_handle(material_asset_path),
                         transform: Transform::from_translation(Vec3::new(
-                            vox.x as f32,
-                            vox.y as f32,
-                            vox.z as f32,
+                            x as f32, y as f32, z as f32,
                         )),
                         ..Default::default()
                     });
                 }
             });
+
+        last_model = Some(model);
     }
 
-    load_context.set_default_asset(LoadedAsset::new(Scene::new(world)));
+    let size = last_model.expect("No models found").size;
+    let scene = Scene::new(world);
+
+    let scene = load_context.set_labeled_asset(&scene_label(&scene), LoadedAsset::new(scene));
+
+    let size = if swap_yz {
+        Vec3::new(size.x as f32, size.z as f32, size.y as f32)
+    } else {
+        Vec3::new(size.x as f32, size.y as f32, size.z as f32)
+    };
+
+    load_context.set_default_asset(LoadedAsset::new(VoxAsset { scene, size }));
 
     Ok(())
 }
 
 fn palette_label(index: usize) -> String {
     format!("palette{}", index)
+}
+
+fn scene_label(scene: &Scene) -> String {
+    format!("scene{:?}", scene.world.id())
 }
 
 fn palette_to_color(from: u32) -> Color {
